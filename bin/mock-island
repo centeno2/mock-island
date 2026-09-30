@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT="${MOCK_ISLAND_DIR:-$HOME/Projects/mock-island}"
+BRIDGE="$PROJECT/backend/ai_bridge.py"
+SERVICE="mock-island.service"
+
+usage() {
+  cat <<'EOF'
+Mock Island
+
+Uso:
+  mock-island start|stop|restart|status|logs
+  mock-island toggle|open|close       # controla la isla por IPC
+  mock-island run                     # primer plano
+  mock-island provider NOMBRE [MODELO]
+  mock-island probe [NOMBRE]
+  mock-island models [NOMBRE]          # lista modelos detectados
+  mock-island key NOMBRE
+  mock-island clear
+  mock-island ask "mensaje"
+  mock-island theme
+  mock-island bind                    # instala Super+Espacio en Niri
+
+Proveedores:
+  mock, ollama, lmstudio, openai, openrouter, anthropic, gemini, nvidia, custom
+EOF
+}
+
+focused_output() {
+  if command -v niri >/dev/null 2>&1 && [[ -n "${NIRI_SOCKET:-}" ]]; then
+    niri msg --json focused-output 2>/dev/null | python3 -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print(""); raise SystemExit
+if isinstance(d,dict):
+    if isinstance(d.get("name"),str): print(d["name"]); raise SystemExit
+    # tolerate wrapped IPC responses
+    stack=[d]
+    while stack:
+        x=stack.pop()
+        if isinstance(x,dict):
+            if isinstance(x.get("name"),str) and any(k in x for k in ("make","model","serial","logical")):
+                print(x["name"]); raise SystemExit
+            stack.extend(x.values())
+        elif isinstance(x,list): stack.extend(x)
+print("")
+' 2>/dev/null || true
+  fi
+}
+
+ensure_running() {
+  if ! systemctl --user is-active --quiet "$SERVICE"; then
+    systemctl --user start "$SERVICE"
+    sleep 0.35
+  fi
+}
+
+ipc_call() {
+  ensure_running
+  # -p selects this Quickshell configuration so DMS is not targeted by mistake.
+  if qs -p "$PROJECT/shell.qml" ipc call mockIsland "$@" 2>/dev/null; then
+    return 0
+  fi
+  qs ipc call mockIsland "$@"
+}
+
+setup_bind() {
+  local dir="$HOME/.config/niri"
+  local cfg="$dir/config.kdl"
+  local bindfile="$dir/mock-island.kdl"
+  mkdir -p "$dir"
+
+  if [[ ! -f "$cfg" ]]; then
+    echo "⚠ No encontré $cfg; no toqué los atajos de Niri." >&2
+    return 1
+  fi
+
+  local conflict=""
+  conflict=$(grep -RIn --include='*.kdl' --exclude='mock-island.kdl' --exclude='centeno-island.kdl' \
+    -E '^[[:space:]]*Mod\+Space([[:space:]]|$)' "$dir" 2>/dev/null | head -n1 || true)
+  if [[ -n "$conflict" ]]; then
+    echo "⚠ Super+Espacio ya está ocupado: $conflict" >&2
+    echo "  No lo sobrescribí. Puedes quitar ese bind y ejecutar: mock-island bind" >&2
+    return 2
+  fi
+
+  cat > "$bindfile" <<EOF
+binds {
+    Mod+Space repeat=false hotkey-overlay-title="Mock AI" {
+        spawn "$HOME/.local/bin/mock-island" "toggle";
+    }
+}
+EOF
+
+  local backup="$cfg.mock-island.bak"
+  cp -f "$cfg" "$backup"
+  if ! grep -Fq 'include "mock-island.kdl"' "$cfg"; then
+    printf '\ninclude "mock-island.kdl"\n' >> "$cfg"
+  fi
+
+  if niri validate >/dev/null 2>&1; then
+    niri msg action load-config-file >/dev/null 2>&1 || true
+    echo "✓ Super+Espacio → Mock"
+  else
+    cp -f "$backup" "$cfg"
+    echo "⚠ Niri rechazó el include; restauré $cfg" >&2
+    niri validate || true
+    return 3
+  fi
+}
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  start) systemctl --user start "$SERVICE" ;;
+  stop) systemctl --user stop "$SERVICE" ;;
+  restart) systemctl --user restart "$SERVICE" ;;
+  status)
+    systemctl --user status "$SERVICE" --no-pager || true
+    echo
+    python3 "$BRIDGE" status | python3 -m json.tool || true
+    ;;
+  logs) journalctl --user -u "$SERVICE" -f ;;
+  run)
+    export MOCK_ISLAND_DIR="$PROJECT"
+    exec qs -p "$PROJECT/shell.qml"
+    ;;
+  toggle)
+    out="$(focused_output)"
+    ipc_call toggle "$out"
+    ;;
+  open)
+    out="$(focused_output)"
+    ipc_call open "$out"
+    ;;
+  close) ipc_call close ;;
+  provider)
+    [[ $# -ge 1 ]] || { usage; exit 2; }
+    python3 "$BRIDGE" provider "$@" | python3 -m json.tool
+    ;;
+  probe)
+    if [[ $# -ge 1 ]]; then
+      python3 "$BRIDGE" probe --provider "$1" | python3 -m json.tool
+    else
+      python3 "$BRIDGE" status | python3 -m json.tool
+    fi
+    ;;
+  models)
+    provider="${1:-}"
+    if [[ -n "$provider" ]]; then
+      python3 "$BRIDGE" probe --provider "$provider" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("\n".join(d.get("models", [])))'
+    else
+      python3 "$BRIDGE" status | python3 -c 'import json,sys; d=json.load(sys.stdin); print("\n".join(d.get("models", [])))'
+    fi
+    ;;
+  key)
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    python3 "$BRIDGE" key "$1"
+    ;;
+  clear) python3 "$BRIDGE" clear ;;
+  ask)
+    [[ $# -ge 1 ]] || { usage; exit 2; }
+    printf '%s\n' "$*" | python3 "$BRIDGE" ask
+    ;;
+  theme) python3 "$BRIDGE" theme | python3 -m json.tool ;;
+  bind) setup_bind ;;
+  ""|-h|--help|help) usage ;;
+  *) echo "Comando desconocido: $cmd" >&2; usage; exit 2 ;;
+esac

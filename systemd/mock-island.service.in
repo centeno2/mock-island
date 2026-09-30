@@ -1,0 +1,14 @@
+[Unit]
+Description=Mock Island AI assistant
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+Environment=MOCK_ISLAND_DIR=@PROJECT@
+ExecStart=@QS@ -p @PROJECT@/shell.qml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
