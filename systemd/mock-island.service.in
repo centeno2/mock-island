@@ -1,5 +1,5 @@
 [Unit]
-Description=Mock Island AI assistant
+Description=Mock Island shell-native AI companion
 PartOf=graphical-session.target
 After=graphical-session.target
 

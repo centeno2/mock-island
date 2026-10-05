@@ -5,6 +5,8 @@ import argparse
 import getpass
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -13,6 +15,8 @@ import urllib.request
 import unicodedata
 from pathlib import Path
 from typing import Dict, Iterable, List
+
+from linux_context import desktop_context, file_context
 
 APP = "mock-island"
 HOME = Path.home()
@@ -26,13 +30,29 @@ DMS_COLORS = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "DankMate
 DEFAULT_CONFIG = {
     "provider": "mock",
     "system_prompt": (
-        "Eres Mock, un asistente de escritorio técnico, conciso y útil. "
+        "Eres Mock, un compañero técnico integrado al escritorio Linux. "
         "Responde en español salvo que el usuario pida otro idioma. "
-        "Prioriza soluciones prácticas, comandos claros y explicaciones directas."
+        "Prioriza soluciones prácticas y explicaciones directas. "
+        "Mock Island incluye un Agent Runtime separado que sí puede inspeccionar y actuar sobre el PC mediante herramientas controladas; "
+        "no afirmes de forma general que Mock carece de acceso al equipo o a la terminal. "
+        "Si recibes bloques de contexto del escritorio, úsalos solo como contexto explícitamente adjuntado por el usuario."
     ),
     "max_history_messages": 16,
     "temperature": 0.7,
     "max_tokens": 4096,
+    "agent": {
+        "enabled": True,
+        "auto_execute_safe": True,
+        "max_actions": 6,
+        "allow_terminal": True
+    },
+    "voice": {
+        "tts_enabled": False,
+        "auto_send": True,
+        "language": "es",
+        "whisper_model": str(Path.home() / ".local/share/mock-island/models/ggml-base.bin"),
+        "piper_voice": "es_ES-davefx-medium"
+    },
     "providers": {
         "mock": {"base_url": "", "model": "mock-1"},
         "ollama": {"base_url": "http://127.0.0.1:11434", "model": ""},
@@ -102,19 +122,42 @@ def save_config(cfg: dict) -> None:
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
 
 
-def load_secrets() -> Dict[str, str]:
-    ensure_dirs()
-    env = dict(os.environ)
+def _secret_service_lookup(provider: str) -> str:
+    if not shutil.which("secret-tool"):
+        return ""
     try:
-        for raw in SECRETS_FILE.read_text().splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            env.setdefault(key.strip(), value.strip())
-    except OSError:
+        p = subprocess.run(
+            ["secret-tool", "lookup", "service", APP, "provider", provider],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=4, check=False,
+        )
+        return p.stdout.strip() if p.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _secret_service_store(provider: str, value: str) -> bool:
+    if not shutil.which("secret-tool"):
+        return False
+    try:
+        p = subprocess.run(
+            ["secret-tool", "store", f"--label=Mock Island · {provider}", "service", APP, "provider", provider],
+            input=value, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, timeout=20, check=False,
+        )
+        return p.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _secret_service_clear(provider: str) -> None:
+    if not shutil.which("secret-tool"):
+        return
+    try:
+        subprocess.run(
+            ["secret-tool", "clear", "service", APP, "provider", provider],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
         pass
-    return env
 
 
 def _secret_entries() -> Dict[str, str]:
@@ -131,27 +174,52 @@ def _secret_entries() -> Dict[str, str]:
     return entries
 
 
+def _write_secret_entries(entries: Dict[str, str]) -> None:
+    content = "# Mock Island secrets · fallback when Secret Service is unavailable\n"
+    if entries:
+        content += "\n".join(f"{k}={v}" for k, v in sorted(entries.items())) + "\n"
+    SECRETS_FILE.write_text(content)
+    SECRETS_FILE.chmod(0o600)
+
+
+def load_secrets() -> Dict[str, str]:
+    ensure_dirs()
+    env = dict(os.environ)
+    legacy = _secret_entries()
+    for provider, key in SECRET_ENV.items():
+        if env.get(key):
+            continue
+        secure = _secret_service_lookup(provider)
+        if secure:
+            env[key] = secure
+        elif legacy.get(key):
+            env[key] = legacy[key]
+    return env
+
+
 def set_secret(provider: str, value: str) -> None:
     ensure_dirs()
     key = SECRET_ENV.get(provider)
     if not key:
         raise SystemExit(f"{provider} no usa clave API administrada por Mock")
     entries = _secret_entries()
+    if _secret_service_store(provider, value):
+        # Remove an older plaintext fallback once the secure store succeeds.
+        entries.pop(key, None)
+        _write_secret_entries(entries)
+        return
     entries[key] = value
-    content = "# Mock Island secrets\n" + "\n".join(f"{k}={v}" for k, v in sorted(entries.items())) + "\n"
-    SECRETS_FILE.write_text(content)
-    SECRETS_FILE.chmod(0o600)
+    _write_secret_entries(entries)
 
 
 def clear_secret(provider: str) -> None:
     key = SECRET_ENV.get(provider)
     if not key:
         return
+    _secret_service_clear(provider)
     entries = _secret_entries()
     entries.pop(key, None)
-    content = "# Mock Island secrets\n" + "\n".join(f"{k}={v}" for k, v in sorted(entries.items()))
-    SECRETS_FILE.write_text(content + ("\n" if content else ""))
-    SECRETS_FILE.chmod(0o600)
+    _write_secret_entries(entries)
 
 
 def emit(kind: str, **kwargs) -> None:
@@ -229,6 +297,8 @@ class SmoothEmitter:
 def theme_payload() -> dict:
     fallback = {
         "primary": "#9fc9ff",
+        "secondary": "#b9c7dc",
+        "tertiary": "#b9c9ff",
         "surface": "#11161c",
         "surface_container": "#171d24",
         "surface_high": "#1f2731",
@@ -243,6 +313,8 @@ def theme_payload() -> dict:
         dark = data.get("colors", {}).get("dark", {})
         keys = {
             "primary": "primary",
+            "secondary": "secondary",
+            "tertiary": "tertiary",
             "surface": "surface",
             "surface_container": "surface_container",
             "surface_high": "surface_container_high",
@@ -449,6 +521,8 @@ def provider_probe(provider: str | None = None) -> dict:
         "temperature": float(cfg.get("temperature", 0.7)),
         "max_tokens": int(cfg.get("max_tokens", 4096)),
         "system_prompt": str(cfg.get("system_prompt", DEFAULT_CONFIG["system_prompt"])),
+        "agent": cfg.get("agent", DEFAULT_CONFIG["agent"]),
+        "voice": cfg.get("voice", DEFAULT_CONFIG["voice"]),
     }
 
 
@@ -717,8 +791,8 @@ def ask(args) -> int:
 
     temperature = max(0.0, min(2.0, float(cfg.get("temperature", 0.7))))
     max_tokens = max(64, min(131072, int(cfg.get("max_tokens", 4096))))
-    hist = history_load()
-    system_prompt = cfg.get("system_prompt", DEFAULT_CONFIG["system_prompt"])
+    hist = [] if getattr(args, "no_history", False) else history_load()
+    system_prompt = getattr(args, "system_prompt", None) or cfg.get("system_prompt", DEFAULT_CONFIG["system_prompt"])
     messages = [{"role": "system", "content": system_prompt}] + hist + [{"role": "user", "content": prompt}]
     emit("meta", provider=provider, model=model or "auto", temperature=temperature, max_tokens=max_tokens)
     emitter = SmoothEmitter()
@@ -740,8 +814,9 @@ def ask(args) -> int:
         else:
             raise RuntimeError(f"Proveedor no soportado: {provider}")
 
-        hist.extend([{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}])
-        history_save(hist, int(cfg.get("max_history_messages", 16)))
+        if not getattr(args, "no_history", False):
+            hist.extend([{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}])
+            history_save(hist, int(cfg.get("max_history_messages", 16)))
         emit("done")
         return 0
     except urllib.error.HTTPError as e:
@@ -804,6 +879,14 @@ def cmd_configure(stdin_mode: bool) -> None:
             pass
     if "system_prompt" in data and str(data.get("system_prompt") or "").strip():
         cfg["system_prompt"] = str(data["system_prompt"]).strip()
+    if "agent_enabled" in data:
+        cfg.setdefault("agent", {})["enabled"] = bool(data.get("agent_enabled"))
+    if "agent_auto_execute_safe" in data:
+        cfg.setdefault("agent", {})["auto_execute_safe"] = bool(data.get("agent_auto_execute_safe"))
+    if "voice_tts_enabled" in data:
+        cfg.setdefault("voice", {})["tts_enabled"] = bool(data.get("voice_tts_enabled"))
+    if "voice_auto_send" in data:
+        cfg.setdefault("voice", {})["auto_send"] = bool(data.get("voice_auto_send"))
     save_config(cfg)
 
     if bool(data.get("clear_api_key")):
@@ -826,10 +909,38 @@ def cmd_key(provider: str) -> None:
     print(f"Guardada en {SECRETS_FILE} (0600)")
 
 
+
+def cmd_preferences() -> None:
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except Exception as exc:
+        raise SystemExit(f"JSON inválido: {exc}")
+    cfg = load_config()
+    agent = cfg.setdefault("agent", {})
+    voice = cfg.setdefault("voice", {})
+    if "agent_enabled" in data:
+        agent["enabled"] = bool(data.get("agent_enabled"))
+    if "agent_auto_execute_safe" in data:
+        agent["auto_execute_safe"] = bool(data.get("agent_auto_execute_safe"))
+    if "voice_tts_enabled" in data:
+        voice["tts_enabled"] = bool(data.get("voice_tts_enabled"))
+    if "voice_auto_send" in data:
+        voice["auto_send"] = bool(data.get("voice_auto_send"))
+    save_config(cfg)
+    print(json.dumps({"ok": True, "agent": agent, "voice": voice}, ensure_ascii=False))
+
 def cmd_clear() -> None:
     ensure_dirs()
     HISTORY_FILE.write_text("[]\n")
     print("Historial borrado")
+
+
+def cmd_context(include_clipboard: bool) -> None:
+    print(json.dumps(desktop_context(include_clipboard=include_clipboard), ensure_ascii=False))
+
+
+def cmd_file_context(path: str) -> None:
+    print(json.dumps(file_context(path), ensure_ascii=False))
 
 
 def main() -> int:
@@ -842,10 +953,17 @@ def main() -> int:
     a.add_argument("--model")
     a.add_argument("--base-url")
     a.add_argument("--prompt")
+    a.add_argument("--no-history", action="store_true")
+    a.add_argument("--system-prompt")
 
     sub.add_parser("status")
     sub.add_parser("theme")
     sub.add_parser("clear")
+    sub.add_parser("preferences")
+    ctx = sub.add_parser("context")
+    ctx.add_argument("--clipboard", action="store_true")
+    fc = sub.add_parser("file-context")
+    fc.add_argument("path")
     pr = sub.add_parser("probe")
     pr.add_argument("--provider")
     p = sub.add_parser("provider")
@@ -873,6 +991,12 @@ def main() -> int:
         cmd_key(args.provider); return 0
     if args.cmd == "clear":
         cmd_clear(); return 0
+    if args.cmd == "preferences":
+        cmd_preferences(); return 0
+    if args.cmd == "context":
+        cmd_context(args.clipboard); return 0
+    if args.cmd == "file-context":
+        cmd_file_context(args.path); return 0
     return 0
 
 

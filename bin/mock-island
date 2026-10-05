@@ -3,6 +3,9 @@ set -euo pipefail
 
 PROJECT="${MOCK_ISLAND_DIR:-$HOME/Projects/mock-island}"
 BRIDGE="$PROJECT/backend/ai_bridge.py"
+AGENT="$PROJECT/backend/agent_runtime.py"
+VOICE="$PROJECT/backend/voice_bridge.py"
+DESKTOP="$PROJECT/backend/desktop_adapter.py"
 SERVICE="mock-island.service"
 
 usage() {
@@ -19,8 +22,16 @@ Uso:
   mock-island key NOMBRE
   mock-island clear
   mock-island ask "mensaje"
+  mock-island context [--clipboard]   # contexto del escritorio/media; clipboard solo si se pide
   mock-island theme
-  mock-island bind                    # instala Super+Espacio en Niri
+  mock-island agent-status            # herramientas y dependencias del agente
+  mock-island agent "instrucción"      # prueba/ejecuta el agente desde terminal
+  mock-island desktop-status          # entorno detectado y capacidades disponibles
+  mock-island voice                   # inicia/detiene escucha desde la isla
+  mock-island voice-start|voice-stop|voice-status
+  mock-island voice-setup             # instala STT/TTS local (Whisper + Piper)
+  mock-island doctor                  # comprueba integración Linux
+  mock-island bind                    # instala atajos en Niri/Hyprland/Sway/i3 cuando es seguro
 
 Proveedores:
   mock, ollama, lmstudio, openai, openrouter, anthropic, gemini, nvidia, custom
@@ -28,27 +39,7 @@ EOF
 }
 
 focused_output() {
-  if command -v niri >/dev/null 2>&1 && [[ -n "${NIRI_SOCKET:-}" ]]; then
-    niri msg --json focused-output 2>/dev/null | python3 -c '
-import json,sys
-try:
-    d=json.load(sys.stdin)
-except Exception:
-    print(""); raise SystemExit
-if isinstance(d,dict):
-    if isinstance(d.get("name"),str): print(d["name"]); raise SystemExit
-    # tolerate wrapped IPC responses
-    stack=[d]
-    while stack:
-        x=stack.pop()
-        if isinstance(x,dict):
-            if isinstance(x.get("name"),str) and any(k in x for k in ("make","model","serial","logical")):
-                print(x["name"]); raise SystemExit
-            stack.extend(x.values())
-        elif isinstance(x,list): stack.extend(x)
-print("")
-' 2>/dev/null || true
-  fi
+  python3 "$DESKTOP" output 2>/dev/null || true
 }
 
 ensure_running() {
@@ -67,49 +58,119 @@ ipc_call() {
   qs ipc call mockIsland "$@"
 }
 
-setup_bind() {
-  local dir="$HOME/.config/niri"
-  local cfg="$dir/config.kdl"
-  local bindfile="$dir/mock-island.kdl"
+setup_bind_niri() {
+  local dir="$HOME/.config/niri" cfg="$HOME/.config/niri/config.kdl" bindfile="$HOME/.config/niri/mock-island.kdl"
+  [[ -f "$cfg" ]] || return 1
   mkdir -p "$dir"
-
-  if [[ ! -f "$cfg" ]]; then
-    echo "⚠ No encontré $cfg; no toqué los atajos de Niri." >&2
-    return 1
+  if grep -RIn --include='*.kdl' --exclude='mock-island.kdl' -E '^[[:space:]]*Mod\+Space([[:space:]]|$)' "$dir" 2>/dev/null | head -n1 | grep -q .; then
+    echo "⚠ Super+Espacio ya está ocupado en Niri; no lo sobrescribí." >&2; return 2
   fi
-
-  local conflict=""
-  conflict=$(grep -RIn --include='*.kdl' --exclude='mock-island.kdl' --exclude='centeno-island.kdl' \
-    -E '^[[:space:]]*Mod\+Space([[:space:]]|$)' "$dir" 2>/dev/null | head -n1 || true)
-  if [[ -n "$conflict" ]]; then
-    echo "⚠ Super+Espacio ya está ocupado: $conflict" >&2
-    echo "  No lo sobrescribí. Puedes quitar ese bind y ejecutar: mock-island bind" >&2
-    return 2
-  fi
-
   cat > "$bindfile" <<EOF
 binds {
-    Mod+Space repeat=false hotkey-overlay-title="Mock AI" {
-        spawn "$HOME/.local/bin/mock-island" "toggle";
-    }
+    Mod+Space repeat=false hotkey-overlay-title="Mock AI" { spawn "$HOME/.local/bin/mock-island" "toggle"; }
+    Mod+Alt+V repeat=false hotkey-overlay-title="Mock Voice" { spawn "$HOME/.local/bin/mock-island" "voice"; }
 }
 EOF
-
-  local backup="$cfg.mock-island.bak"
-  cp -f "$cfg" "$backup"
-  if ! grep -Fq 'include "mock-island.kdl"' "$cfg"; then
-    printf '\ninclude "mock-island.kdl"\n' >> "$cfg"
-  fi
-
+  cp -f "$cfg" "$cfg.mock-island.bak"
+  grep -Fq 'include "mock-island.kdl"' "$cfg" || printf '\ninclude "mock-island.kdl"\n' >> "$cfg"
   if niri validate >/dev/null 2>&1; then
     niri msg action load-config-file >/dev/null 2>&1 || true
-    echo "✓ Super+Espacio → Mock"
-  else
-    cp -f "$backup" "$cfg"
-    echo "⚠ Niri rechazó el include; restauré $cfg" >&2
-    niri validate || true
-    return 3
+    echo "✓ Atajos instalados para Niri"; return 0
   fi
+  cp -f "$cfg.mock-island.bak" "$cfg"
+  echo "⚠ Niri rechazó la configuración; restauré el backup." >&2
+  return 3
+}
+
+setup_bind_hyprland() {
+  local cfg="$HOME/.config/hypr/hyprland.conf" inc="$HOME/.config/hypr/mock-island.conf"
+  [[ -f "$cfg" ]] || return 1
+  if grep -RIn --include='*.conf' -E 'bind[^=]*=[^,]*SUPER[^,]*,[[:space:]]*SPACE[[:space:]],' "$HOME/.config/hypr" 2>/dev/null | grep -v mock-island.conf | head -n1 | grep -q .; then
+    echo "⚠ SUPER+SPACE ya está ocupado en Hyprland; no lo sobrescribí." >&2; return 2
+  fi
+  cat > "$inc" <<EOF
+bind = SUPER, SPACE, exec, $HOME/.local/bin/mock-island toggle
+bind = SUPER ALT, V, exec, $HOME/.local/bin/mock-island voice
+EOF
+  grep -Fq 'source = ~/.config/hypr/mock-island.conf' "$cfg" || printf '\nsource = ~/.config/hypr/mock-island.conf\n' >> "$cfg"
+  hyprctl reload >/dev/null 2>&1 || true
+  echo "✓ Atajos instalados para Hyprland"
+}
+
+setup_bind_i3like() {
+  local backend="$1" cfg exe
+  if [[ "$backend" == "sway" ]]; then cfg="$HOME/.config/sway/config"; exe="swaymsg"; else cfg="$HOME/.config/i3/config"; exe="i3-msg"; fi
+  [[ -f "$cfg" ]] || return 1
+  if grep -E '^[[:space:]]*bindsym[[:space:]]+\$mod\+space\b' "$cfg" >/dev/null 2>&1; then
+    echo "⚠ \$mod+space ya está ocupado en $backend; no lo sobrescribí." >&2; return 2
+  fi
+  cp -f "$cfg" "$cfg.mock-island.bak"
+  cat >> "$cfg" <<EOF
+
+# Mock Island
+bindsym \$mod+space exec $HOME/.local/bin/mock-island toggle
+bindsym \$mod+Mod1+v exec $HOME/.local/bin/mock-island voice
+EOF
+  "$exe" reload >/dev/null 2>&1 || true
+  echo "✓ Atajos instalados para $backend"
+}
+
+setup_bind() {
+  local backend
+  backend="$(python3 "$DESKTOP" status 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("backend","generic"))' 2>/dev/null || echo generic)"
+  case "$backend" in
+    niri) setup_bind_niri ;;
+    hyprland) setup_bind_hyprland ;;
+    sway|i3) setup_bind_i3like "$backend" ;;
+    *)
+      echo "· $backend: no modificaré los atajos del escritorio automáticamente."
+      echo "  Asigna Super+Espacio a: $HOME/.local/bin/mock-island toggle"
+      echo "  Y opcionalmente Super+Alt+V a: $HOME/.local/bin/mock-island voice"
+      ;;
+  esac
+}
+
+doctor() {
+  local fail=0
+  printf 'Mock Island · doctor\n\n'
+  for cmd in qs python3; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      printf '  ✓ %-12s %s\n' "$cmd" "$(command -v "$cmd")"
+    else
+      printf '  ✗ %-12s no encontrado\n' "$cmd"
+      fail=1
+    fi
+  done
+  for cmd in wl-copy wl-paste xclip xsel playerctl notify-send wpctl pactl grim spectacle gnome-screenshot scrot pw-record pw-play; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      printf '  ✓ %-12s disponible\n' "$cmd"
+    else
+      printf '  · %-12s opcional\n' "$cmd"
+    fi
+  done
+  local local_whisper="${XDG_DATA_HOME:-$HOME/.local/share}/mock-island/whisper.cpp/build/bin/whisper-cli"
+  if command -v whisper-cli >/dev/null 2>&1; then
+    printf '  ✓ %-12s %s\n' 'whisper' "$(command -v whisper-cli)"
+  elif [[ -x "$local_whisper" ]]; then
+    printf '  ✓ %-12s %s\n' 'whisper' "$local_whisper"
+  else
+    printf '  · %-12s ejecuta mock-island voice-setup\n' 'whisper'
+  fi
+  if [[ -f "${XDG_CACHE_HOME:-$HOME/.cache}/DankMaterialShell/dms-colors.json" ]]; then
+    printf '  ✓ %-12s colores dinámicos detectados\n' 'DMS'
+  else
+    printf '  · %-12s usando paleta fallback\n' 'DMS'
+  fi
+  if systemctl --user is-active --quiet "$SERVICE" 2>/dev/null; then
+    printf '  ✓ %-12s activo\n' 'service'
+  else
+    printf '  · %-12s detenido\n' 'service'
+  fi
+  printf '\nDesktop adapter:\n'
+  python3 "$DESKTOP" status | python3 -m json.tool || fail=1
+  printf '\nContexto:\n'
+  python3 "$BRIDGE" context | python3 -m json.tool || fail=1
+  return "$fail"
 }
 
 cmd="${1:-}"
@@ -165,7 +226,42 @@ case "$cmd" in
     [[ $# -ge 1 ]] || { usage; exit 2; }
     printf '%s\n' "$*" | python3 "$BRIDGE" ask
     ;;
+  context)
+    python3 "$BRIDGE" context "$@" | python3 -m json.tool
+    ;;
   theme) python3 "$BRIDGE" theme | python3 -m json.tool ;;
+  agent-status) python3 "$AGENT" status | python3 -m json.tool ;;
+  agent)
+    [[ $# -ge 1 ]] || { usage; exit 2; }
+    prompt="$*"
+    provider="$(python3 "$BRIDGE" status | python3 -c 'import json,sys; print(json.load(sys.stdin).get("provider","mock"))')"
+    model="$(python3 "$BRIDGE" status | python3 -c 'import json,sys; print(json.load(sys.stdin).get("model","") or "")')"
+    plan="$(printf '%s\n' "$prompt" | python3 "$AGENT" plan --provider "$provider" --model "$model" --stdin)"
+    printf '%s\n' "$plan" | python3 -m json.tool
+    needs="$(printf '%s' "$plan" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("needs_confirmation") else "0")')"
+    mode="$(printf '%s' "$plan" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("mode","chat"))')"
+    if [[ "$mode" != agent ]]; then
+      echo "· La solicitud fue clasificada como conversación; úsala desde la isla para chat."
+      exit 0
+    fi
+    approved=()
+    if [[ "$needs" == 1 ]]; then
+      read -r -p '¿Ejecutar las acciones que requieren permiso? [s/N] ' answer
+      [[ "$answer" =~ ^[sSyY]$ ]] || { echo 'Cancelado.'; exit 0; }
+      approved=(--approved)
+    fi
+    printf '%s' "$plan" | python3 "$AGENT" execute --provider "$provider" --model "$model" "${approved[@]}" --stdin | python3 -m json.tool
+    ;;
+  desktop-status) python3 "$DESKTOP" status | python3 -m json.tool ;;
+  voice)
+    out="$(focused_output)"
+    ipc_call voiceToggle "$out"
+    ;;
+  voice-start) python3 "$VOICE" record-start | python3 -m json.tool ;;
+  voice-stop) python3 "$VOICE" record-stop | python3 -m json.tool ;;
+  voice-status) python3 "$VOICE" status | python3 -m json.tool ;;
+  voice-setup) exec "$PROJECT/scripts/setup-voice.sh" ;;
+  doctor) doctor ;;
   bind) setup_bind ;;
   ""|-h|--help|help) usage ;;
   *) echo "Comando desconocido: $cmd" >&2; usage; exit 2 ;;

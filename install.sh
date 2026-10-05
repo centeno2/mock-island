@@ -28,12 +28,35 @@ if p.exists():
     except Exception:
         data = {}
     sp = str(data.get("system_prompt") or "")
+    changed = False
     if "Centeno Island" in sp or "centeno island" in sp.lower():
         data["system_prompt"] = (
-            "Eres Mock, un asistente de escritorio técnico, conciso y útil. "
+            "Eres Mock, un compañero técnico integrado al escritorio Linux. "
             "Responde en español salvo que el usuario pida otro idioma. "
-            "Prioriza soluciones prácticas, comandos claros y explicaciones directas."
+            "Prioriza soluciones prácticas, comandos claros y explicaciones directas. "
+            "Cuando el modo agente esté activo puedes usar las herramientas del runtime para observar y actuar sobre el PC con permisos explícitos para acciones sensibles."
         )
+        changed = True
+    migrations = data.setdefault("_migrations", {})
+    if not migrations.get("v11_agent_default"):
+        data.setdefault("agent", {})["enabled"] = True
+        migrations["v11_agent_default"] = True
+        changed = True
+    if not migrations.get("v12_agent_prompt"):
+        # Solo reemplaza prompts de fábrica conocidos; respeta prompts personalizados.
+        if (not sp) or ("Eres Mock" in sp and "Agent Runtime" not in sp):
+            data["system_prompt"] = (
+                "Eres Mock, un compañero técnico integrado al escritorio Linux. "
+                "Responde en español salvo que el usuario pida otro idioma. "
+                "Prioriza soluciones prácticas y explicaciones directas. "
+                "Mock Island incluye un Agent Runtime separado que sí puede inspeccionar y actuar sobre el PC mediante herramientas controladas; "
+                "no afirmes de forma general que Mock carece de acceso al equipo o a la terminal."
+            )
+            changed = True
+        data.setdefault("agent", {})["enabled"] = True
+        migrations["v12_agent_prompt"] = True
+        changed = True
+    if changed:
         p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 PYMIG
 
@@ -60,7 +83,7 @@ if [[ "$PROJECT" != "$TARGET" ]]; then
   mv "$TARGET.new" "$TARGET"
 fi
 
-chmod +x "$TARGET/backend/ai_bridge.py" "$TARGET/bin/mock-island"
+chmod +x "$TARGET/backend/ai_bridge.py" "$TARGET/backend/linux_context.py" "$TARGET/backend/desktop_adapter.py" "$TARGET/backend/agent_runtime.py" "$TARGET/backend/voice_bridge.py" "$TARGET/bin/mock-island" "$TARGET/scripts/check.sh" "$TARGET/scripts/setup-voice.sh"
 ln -sfn "$TARGET/bin/mock-island" "$HOME/.local/bin/mock-island"
 # Compatibilidad: los comandos viejos siguen funcionando, pero todo apunta a Mock Island.
 ln -sfn "$TARGET/bin/mock-island" "$HOME/.local/bin/centeno-island"
@@ -70,7 +93,7 @@ python3 "$TARGET/backend/ai_bridge.py" status >/dev/null
 sed -e "s|@PROJECT@|$TARGET|g" -e "s|@QS@|$QS|g" \
   "$TARGET/systemd/mock-island.service.in" > "$HOME/.config/systemd/user/mock-island.service"
 
-# Limpia el include antiguo de Niri antes de instalar el nuevo bind.
+# Limpia branding/atajos antiguos de Niri si existen; otros escritorios no se tocan aquí.
 NIRI_CFG="$HOME/.config/niri/config.kdl"
 if [[ -f "$NIRI_CFG" ]]; then
   cp -f "$NIRI_CFG" "$NIRI_CFG.mock-island-migration.bak"
@@ -84,16 +107,24 @@ systemctl --user enable --now mock-island.service
 "$HOME/.local/bin/mock-island" bind || true
 
 echo
-echo "✓ Mock Island v7.1 instalado en $TARGET"
+echo "✓ Mock Island v13 Agent Shell instalado en $TARGET"
 echo "✓ Super + Espacio abre/cierra Mock"
-echo "✓ Sin respuesta todavía: la isla permanece compacta"
-echo "✓ Cambiar de proveedor cancela una petición activa y cambia correctamente"
-echo "✓ NVIDIA Nemotron 3 usa parámetros recomendados y filtro de salida corrupta"
-echo "✓ Modelos, API y parámetros siguen dentro de Ajustes"
-echo "✓ Streaming y autoscroll ajustados para respuestas largas"
+echo "✓ Isla compacta restaurada al borde inferior + Pulse/Peek activados"
+echo "✓ Paleta Material You completa restaurada desde DMS, con fallback oscuro si DMS no está disponible"
+echo "✓ Desktop Adapter: Niri, Hyprland, Sway/i3 y fallbacks KDE/X11 detectados automáticamente"
+echo "✓ Si cierras Mock mientras responde, Pulse mantiene el estado y avisa al terminar"
+echo "✓ PC Agent real: sistema, paquetes, apps, archivos, procesos, workspaces, audio y terminal con permisos"
+echo "✓ Voz local opcional: MIC + Whisper.cpp; TTS con Piper tras ejecutar mock-island voice-setup"
+echo "✓ Atajos automáticos cuando el entorno permite editarlos con seguridad; KDE/GNOME muestran el comando a asignar"
+echo "✓ Proveedores, streaming, historial y ajustes anteriores se conservan"
 echo
 echo "Pruebas útiles:"
 echo "  mock-island status"
 echo "  mock-island probe ollama"
 echo "  mock-island models nvidia"
+echo "  mock-island context --clipboard"
+echo "  mock-island agent-status"
+echo "  mock-island voice-status"
+echo "  mock-island voice-setup    # solo una vez, descarga modelos"
+echo "  mock-island doctor"
 echo "  mock-island logs"
